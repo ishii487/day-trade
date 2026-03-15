@@ -1,70 +1,61 @@
-import talib
-import numpy as np
 import pandas as pd
+import numpy as np
+import os
+from datetime import datetime, timedelta
 
-def add_features(df):
+# 保存先
+FI_LOG_PATH = "data/processed/feature_importance_log.csv"
+
+def save_feature_importance(model, features):
     """
-    TA-Libを用いて多角的な特徴量（トレンド、モメンタム、ボラティリティ、出来高）を追加する
+    学習完了後に、LightGBMのモデルから特徴量重要度を取得しCSVに追記保存する
     """
-    # ---------------------------------------------------------
-    # 1. ボラティリティ（変動率・価格帯）
-    # ---------------------------------------------------------
-    # ATR (Average True Range): 既にトレイリングストップで利用中だが特徴量としても優秀
-    df['ATR'] = talib.ATR(df['High'], df['Low'], df['Close'], timeperiod=14)
+    # importance_type='gain' は、その特徴量がどれだけ分岐の精度向上に貢献したかを示します
+    importance = model.feature_importance(importance_type='gain')
     
-    # ボリンジャーバンド: ±2シグマのバンド幅と、現在値のバンド内位置を計算
-    df['BB_upper'], df['BB_middle'], df['BB_lower'] = talib.BBANDS(
-        df['Close'], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0
-    )
-    # バンド幅（ボラティリティの拡大・縮小を捉えるスクイーズ/エクスパンション）
-    df['BB_width'] = (df['BB_upper'] - df['BB_lower']) / df['BB_middle']
+    # 記録用のデータフレームを作成
+    df_fi = pd.DataFrame({
+        'date': [datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+        **{feat: [imp] for feat, imp in zip(features, importance)}
+    })
     
-    # ---------------------------------------------------------
-    # 2. モメンタム（相場の勢い・買われすぎ/売られすぎ）
-    # ---------------------------------------------------------
-    df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
-    df['MACD'], df['MACD_signal'], df['MACD_hist'] = talib.MACD(df['Close'])
-    
-    # ストキャスティクス: %Kと%D
-    df['STOCH_k'], df['STOCH_d'] = talib.STOCH(
-        df['High'], df['Low'], df['Close'], 
-        fastk_period=5, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0
-    )
+    # CSVに追記（ファイルがなければ新規作成）
+    if os.path.exists(FI_LOG_PATH):
+        df_fi.to_csv(FI_LOG_PATH, mode='a', header=False, index=False)
+    else:
+        df_fi.to_csv(FI_LOG_PATH, index=False)
+        
+    print("特徴量重要度のログを保存しました。")
 
-    # ---------------------------------------------------------
-    # 3. トレンド（方向性と強さ）
-    # ---------------------------------------------------------
-    # ADX (Average Directional Movement Index): トレンドの「強さ」を示す（方向は問わない）
-    df['ADX'] = talib.ADX(df['High'], df['Low'], df['Close'], timeperiod=14)
-
-    # ---------------------------------------------------------
-    # 4. 出来高（資金の流入・流出）
-    # ---------------------------------------------------------
-    # OBV (On Balance Volume): 上昇日の出来高を足し、下落日の出来高を引いた累積値
-    df['OBV'] = talib.OBV(df['Close'], df['Volume'])
-
-    # ---------------------------------------------------------
-    # 5. マルチタイムフレーム・リターン（過去からの変化率）
-    # ---------------------------------------------------------
-    # 単純な現在値ではなく、過去N本前からの「変化率」を入れることで、
-    # 決定木モデルがスケール（価格の絶対値）に依存せずに学習しやすくなります。
-    df['Return_1'] = df['Close'].pct_change(1)   # 1本前からの変化率
-    df['Return_5'] = df['Close'].pct_change(5)   # 5本前からの変化率
-    df['Return_15'] = df['Close'].pct_change(15) # 15本前からの変化率
-    df['Return_30'] = df['Close'].pct_change(30) # 30本前からの変化率
-
-    # TA-Libの計算等で発生した NaN（欠損値）を削除
-    df = df.dropna().reset_index(drop=True)
+def get_dynamic_features(all_features, weeks_back=4, top_n=8):
+    """
+    過去数週間分の重要度ログを読み込み、平均スコアが高い上位N個の特徴量を返す
+    """
+    if not os.path.exists(FI_LOG_PATH):
+        # ログが存在しない初回実行時は、とりあえず全ての特徴量を使用する
+        print("重要度ログが存在しないため、全ての特徴量を使用します。")
+        return all_features
+        
+    df_fi = pd.read_csv(FI_LOG_PATH)
+    df_fi['date'] = pd.to_datetime(df_fi['date'])
     
-    return df
-
-def add_dynamic_target(df, window, quantile):
-    """過去window期間の分布に基づき、上位quantile%に入るリターンを1とするターゲットを作成"""
-    df['future_return'] = df['Close'].shift(-30) / df['Close'] - 1
-    df['rolling_thresh'] = df['future_return'].rolling(window=window).quantile(quantile)
-    df['Target_Long'] = (future_return > df['rolling_thresh']).astype(int)
+    # 過去指定された週間分のデータを抽出
+    cutoff_date = datetime.now() - timedelta(weeks=weeks_back)
+    recent_fi = df_fi[df_fi['date'] >= cutoff_date].copy()
     
-    # 将来のリターン計算で末尾に発生する NaN を削除
-    df = df.dropna().reset_index(drop=True)
+    if len(recent_fi) == 0:
+        return all_features
+        
+    # 日付カラムを除外して、各特徴量の平均重要度を計算
+    mean_importance = recent_fi.drop(columns=['date']).mean()
     
-    return df
+    # スコアが0のもの（全く使われなかったもの）を除外し、上位トップNを取得
+    best_features = mean_importance[mean_importance > 0].nlargest(top_n).index.tolist()
+    
+    # 最低限の特徴量が確保できなかった場合のセーフティネット
+    if len(best_features) < 3:
+        print("有効な特徴量が少なすぎるため、デフォルトのセットを使用します。")
+        return all_features
+        
+    print(f"過去{weeks_back}週間のデータから、以下の特徴量を選定しました: {best_features}")
+    return best_features
