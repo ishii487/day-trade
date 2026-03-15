@@ -2,6 +2,8 @@ import os
 import pandas as pd
 import optuna
 import lightgbm as lgb
+import joblib
+from datetime import datetime
 from src.config import Config
 from src.data_fetcher import KabuDataFetcher
 from src.features import add_features
@@ -98,6 +100,28 @@ def main():
     # (※将来的な拡張：ここで final_model をファイルとして保存する処理を追加します)
     
     print("\n=== 全プロセスが正常に完了しました ===")
+
+def save_model(model, score):
+    """モデルを日時とスコア付きで保存し、latestとしても更新する"""
+    os.makedirs("models", exist_ok=True)
+    
+    # 1. 刻印用ファイル名の作成 (例: model_20260316_1300_S025.joblib)
+    # スコアは小数点以下3桁まで表示
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    formatted_score = f"{score:.3f}".replace(".", "")
+    filename = f"model_{timestamp}_S{formatted_score}.joblib"
+    
+    save_path = os.path.join("models", filename)
+    latest_path = os.path.join("models", "latest.joblib")
+    
+    # 2. 履歴として保存
+    joblib.dump(model, save_path)
+    
+    # 3. 実行用（最新）として上書き保存
+    joblib.dump(model, latest_path)
+    
+    print(f"モデルを保存しました: {save_path}")
+    print("最新モデル(latest.joblib)を更新しました。")
 
 if __name__ == "__main__":
     main()
