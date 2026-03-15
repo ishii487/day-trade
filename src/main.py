@@ -1,46 +1,39 @@
-# src/main.py
-from src.config import Config
-from src.data_fetcher import KabuDataFetcher
-from src.features import add_features, add_dynamic_target
-from src.train import objective
-import optuna
-import pandas as pd
-import sys
-
 def main():
-    print("--- 処理を開始します ---")
+    print("--- 蓄積・学習・最適化フェーズを開始します ---")
     
-    # 1. データ取得
     fetcher = KabuDataFetcher()
-    print(f"銘柄 {Config.SYMBOL} のデータを取得中...")
-    raw_data = fetcher.fetch_historical_data(Config.SYMBOL, Config.EXCHANGE)
+    symbol = Config.SYMBOL
     
-    if raw_data is None:
-        print("エラー: データの取得に失敗しました。kabuステーションが起動しているか確認してください。")
-        return
-
-    # APIのレスポンス形式を確認するために表示
-    print(f"取得データ件数: {len(raw_data)}")
+    # 1. 最新データの取得
+    print(f"最新の分足データを取得中...")
+    new_data_df = fetcher.fetch_historical_data(symbol, Config.EXCHANGE)
     
-    # 2. DataFrame化
-    # ※APIの仕様に基づき、レスポンスのリストが入っているキーを指定する必要があります
-    # 仮にレスポンスがリストそのものであれば以下でOK
-    try:
-        df = pd.DataFrame(raw_data)
-        if df.empty:
-            print("エラー: データが空です。銘柄登録が済んでいるか確認してください。")
+    if new_data_df is None or new_data_df.empty:
+        print("最新データの取得に失敗しました。既存のCSVのみで続行します。")
+        # CSVだけでも読み込む処理へ
+        file_path = os.path.join(Config.RAW_DATA_PATH, f"{symbol}_history.csv")
+        if os.path.exists(file_path):
+            df = pd.read_csv(file_path)
+        else:
+            print("学習用データがどこにもありません。終了します。")
             return
-    except Exception as e:
-        print(f"DataFrame変換エラー: {e}")
-        return
-    
-    print("特徴量を付与中...")
+    else:
+        # 2. 蓄積データと結合・保存
+        df = fetcher.save_and_merge_data(new_data_df, symbol)
+
+    # 3. 特徴量の付与
+    print("特徴量を計算中...")
     df = add_features(df)
     
-    # 3. 最適化
-    print("Optunaによる最適化を開始します (試行回数: 50)...")
+    # データが少ない場合のガード
+    if len(df) < 50:
+        print(f"データ数が不足しています（現在 {len(df)}件）。学習には最低50〜100件程度を推奨します。")
+        # 試運転を続行する場合はここで return せずに進む
+    
+    # 4. 最適化と学習
+    print(f"過去 {len(df)} 件のデータを用いて最適化を開始します...")
     study = optuna.create_study(direction='maximize')
-    study.optimize(lambda trial: objective(trial, df), n_trials=50)
+    study.optimize(lambda trial: objective(trial, df), n_trials=30)
     
     print("--- 最適化完了 ---")
     print(f"最良スコア: {study.best_value}")
