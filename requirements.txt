@@ -1,0 +1,12 @@
+# API通信・環境変数
+requests
+python-dotenv
+
+# データ処理・数値計算
+pandas
+numpy
+
+# 機械学習・最適化・テクニカル指標
+lightgbm
+optuna
+TA-Lib
