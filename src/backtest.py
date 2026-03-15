@@ -19,49 +19,82 @@ if not KABU_API_PASSWORD:
 # ---------------------------------------------------
 # 2. 高速バックテスト関数（ATRトレイリングストップ）
 # ---------------------------------------------------
-def calculate_trailing_stop_returns(signals, highs, lows, closes, atrs, atr_multiplier):
+def calculate_trailing_stop_returns(signals, high, low, close, atr, atr_multiplier):
     """
-    シグナルとATRトレイリングストップを用いたバックテストを行い、総利益率を返す
+    シグナルとトレイリングストップに基づくバックテストを実行し、詳細な統計を辞書で返す
     """
-    returns = []
+    equity = 1.0  # 初期資金を1（100%）とする
+    equity_curve = [equity]
+    trade_returns = []
+    
+    winning_trades = 0
+    losing_trades = 0
     in_position = False
     entry_price = 0.0
-    highest_price = 0.0
     stop_loss = 0.0
-    
-    # Optuna内で高速に回すため、Numpy配列でループ処理
-    for i in range(len(signals)):
-        if not in_position:
-            if signals[i] == 1:  # エントリーシグナル発生（ロング）
-                in_position = True
-                # 簡単のためシグナル発生足の終値でエントリーと仮定
-                # （より厳密には次足の始値とします）
-                entry_price = closes[i]
-                highest_price = entry_price
-                stop_loss = highest_price - (atrs[i] * atr_multiplier)
-        else:
-            # ポジション保有中：最高値の更新とトレイリングストップの切り上げ
-            if highs[i] > highest_price:
-                highest_price = highs[i]
-                # ストップラインを下げることはせず、高い方のみを採用
-                stop_loss = max(stop_loss, highest_price - (atrs[i] * atr_multiplier))
-            
-            # 安値がストップラインに触れたか判定（損切り・利確の実行）
-            if lows[i] <= stop_loss:
-                # 厳密にはギャップダウンも考慮し、min(始値, stop_loss)等にするのが安全
-                exit_price = stop_loss 
-                trade_return = (exit_price - entry_price) / entry_price
-                returns.append(trade_return)
-                in_position = False
-                
-    # 取引が1回も発生しなかった場合はペナルティとしてマイナス値を返す
-    if len(returns) == 0:
-        return -1.0
-        
-    # 今回は「総利益率（合計リターン）」を評価指標とする
-    # ※ドローダウンを嫌う場合は、シャープレシオなどに変更可能
-    return np.sum(returns)
 
+    # シグナルの配列をループしてトレードをシミュレーション
+    for i in range(len(signals) - 1):
+        if not in_position and signals[i] == 1:
+            # エントリー（買い）
+            in_position = True
+            entry_price = close[i]
+            # 初期ストップロスの設定
+            stop_loss = entry_price - (atr[i] * atr_multiplier)
+        
+        elif in_position:
+            # トレイリングストップの切り上げ
+            current_stop = close[i] - (atr[i] * atr_multiplier)
+            if current_stop > stop_loss:
+                stop_loss = current_stop
+            
+            # 損切り・利確の判定（安値がストップロスに触れたか）
+            if low[i] <= stop_loss:
+                in_position = False
+                # 決済価格はストップロス価格とする（スリッページは一旦考慮しない）
+                trade_return = (stop_loss - entry_price) / entry_price
+                trade_returns.append(trade_return)
+                equity *= (1 + trade_return)
+                
+                if trade_return > 0:
+                    winning_trades += 1
+                else:
+                    losing_trades += 1
+                    
+        # 毎ステップの資産を記録
+        equity_curve.append(equity)
+        
+    # バックテスト終了時にポジションを持っていた場合の時価評価（強制決済）
+    if in_position:
+        trade_return = (close[-1] - entry_price) / entry_price
+        trade_returns.append(trade_return)
+        equity *= (1 + trade_return)
+        if trade_return > 0:
+            winning_trades += 1
+        else:
+            losing_trades += 1
+        equity_curve.append(equity)
+
+    # ---------------------------------------------------------
+    # 統計データの計算
+    # ---------------------------------------------------------
+    total_trades = winning_trades + losing_trades
+    win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
+    
+    # 最大ドローダウン（Max Drawdown）の計算
+    equity_series = pd.Series(equity_curve)
+    rolling_max = equity_series.cummax()  # 過去の最高資産を保持
+    drawdowns = (equity_series - rolling_max) / rolling_max  # 最高値からの下落率
+    max_drawdown = drawdowns.min()  # マイナス方向の最大値
+
+    # レポートと最適化に必要な全データを返す
+    return {
+        'total_return': equity - 1.0,
+        'win_rate': win_rate,
+        'max_drawdown': max_drawdown,
+        'total_trades': total_trades,
+        'equity_curve': equity_curve
+    }
 # ---------------------------------------------------
 # 3. Optuna 目的関数（パイプライン）
 # ---------------------------------------------------

@@ -110,11 +110,11 @@ def objective(trial, df, ranked_features):
     # 学習
     model = lgb.train(lgb_params, dtrain, valid_sets=[dvalid])
     
-    # 予測とバックテスト評価
+# 予測とバックテスト評価
     preds = model.predict(X_valid)
     signals = (preds > 0.5).astype(int)
     
-    total_return = calculate_trailing_stop_returns(
+    backtest_results = calculate_trailing_stop_returns(
         signals, 
         valid_df['High'].values, 
         valid_df['Low'].values, 
@@ -123,4 +123,18 @@ def objective(trial, df, ranked_features):
         atr_multiplier
     )
     
-    return total_return
+    total_return = backtest_results['total_return']
+    max_drawdown = backtest_results['max_drawdown'] # 例: -0.05 (5%の下落)
+    
+    # --- リスク調整後スコアの計算 ---
+    epsilon = 1e-6
+    
+    if total_return <= 0:
+        # 利益がマイナスの場合は、最適化を避けるためにそのままマイナス値を返す
+        score = total_return
+    else:
+        # 利益がプラスの場合、ドローダウンの小ささでスコアをブーストする
+        # （ドローダウンが小さいほど分母が小さくなり、スコアが跳ね上がる）
+        score = total_return / (abs(max_drawdown) + epsilon)
+    
+    return score

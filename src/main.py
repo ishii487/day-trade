@@ -8,6 +8,7 @@ from src.config import Config
 from src.data_fetcher import KabuDataFetcher
 from src.features import add_features
 from src.train import objective, get_dynamic_features_ranked, save_feature_importance
+from src.reporter import generate_report
 
 def main():
     print("=== 自動デイトレード・自律学習システム起動 ===")
@@ -94,14 +95,30 @@ def main():
     # 最終学習
     final_model = lgb.train(lgb_params, lgb.Dataset(X_train, label=y_train))
     
-    # 学習したモデルの「どの特徴量が役立ったか」を保存（次回の[3/5]で使われます）
-    save_feature_importance(final_model, selected_features)
+    final_preds = final_model.predict(X_valid)
+    final_signals = (final_preds > 0.5).astype(int)
     
-    # (※将来的な拡張：ここで final_model をファイルとして保存する処理を追加します)
+    final_backtest_results = calculate_trailing_stop_returns(
+        final_signals, 
+        valid_df['High'].values, 
+        valid_df['Low'].values, 
+        valid_df['Close'].values, 
+        valid_df['ATR'].values, 
+        best_params['atr_multiplier']
+    )
+
+    # 保存処理とレポート生成の呼び出し
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    
+    save_feature_importance(final_model, selected_features)
+    save_model(final_model, study.best_value, selected_features)  # joblibでの保存
+    
+    # 新しいレポーター関数の呼び出し
+    generate_report(final_model, selected_features, final_backtest_results, timestamp, study.best_value)
     
     print("\n=== 全プロセスが正常に完了しました ===")
 
-def save_model(model, score):
+def save_model(model, score, features):
     """モデルを日時とスコア付きで保存し、latestとしても更新する"""
     os.makedirs("models", exist_ok=True)
     
@@ -114,14 +131,14 @@ def save_model(model, score):
     save_path = os.path.join("models", filename)
     latest_path = os.path.join("models", "latest.joblib")
     
-    # 2. 履歴として保存
-    joblib.dump(model, save_path)
-    
-    # 3. 実行用（最新）として上書き保存
-    joblib.dump(model, latest_path)
-    
-    print(f"モデルを保存しました: {save_path}")
-    print("最新モデル(latest.joblib)を更新しました。")
+# モデル本体と、そのモデルが使う特徴量のリストをセットにして保存
+    data_to_save = {
+        'model': model,
+        'features': features
+    }
+    joblib.dump(data_to_save, save_path)
+    joblib.dump(data_to_save, latest_path)
+    print("最新モデルと特徴量リストを保存しました。")
 
 if __name__ == "__main__":
     main()
