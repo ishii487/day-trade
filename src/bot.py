@@ -6,94 +6,147 @@ from datetime import datetime
 from src.config import Config
 from src.data_fetcher import KabuDataFetcher
 from src.features import add_features
+from src.utils.notifier import send_line_notification
 
-# 読み込むモデルのパス
-MODEL_PATH = "models/latest.joblib"
+LOG_PATH = "data/processed/paper_trades.csv"
+
+class PaperTrader:
+    def __init__(self, symbols, initial_cash=1000000):
+        self.cash = initial_cash
+        self.daily_pnl = 0.0
+        
+        # 銘柄リストから動的に辞書を生成（ハードコーディング排除）
+        self.positions = {symbol: 0 for symbol in symbols}
+        self.entry_prices = {symbol: 0.0 for symbol in symbols}
+        self.stop_losses = {symbol: 0.0 for symbol in symbols}
+        self.atr_multipliers = {symbol: 2.0 for symbol in symbols} # 後でモデルから上書き
+        
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        if not os.path.exists(LOG_PATH):
+            df_empty = pd.DataFrame(columns=['timestamp', 'symbol', 'action', 'price', 'quantity', 'realized_pnl', 'cash_balance'])
+            df_empty.to_csv(LOG_PATH, index=False)
+            
+    def log_transaction(self, symbol, action, price, quantity, pnl=0):
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df_log = pd.DataFrame([[now_str, symbol, action, price, quantity, pnl, self.cash]], 
+                              columns=['timestamp', 'symbol', 'action', 'price', 'quantity', 'realized_pnl', 'cash_balance'])
+        df_log.to_csv(LOG_PATH, mode='a', header=False, index=False)
+        
+        # LINE通知
+        if action == "BUY":
+            send_line_notification(f"📈 【{symbol} 新規買い】\n単価: {price:,.1f}円 | {quantity}株")
+        elif action in ["SELL", "CLOSE_MARKET"]:
+            self.daily_pnl += pnl
+            status = "利確" if pnl > 0 else "損切"
+            send_line_notification(f"📉 【{symbol} 決済売り ({status})】\n単価: {price:,.1f}円\n損益: {pnl:+,.0f}円")
+            
+    def print_status(self, current_prices):
+        total_stock_value = sum(self.positions[sym] * current_prices.get(sym, 0) for sym in self.positions)
+        total_value = self.cash + total_stock_value
+        profit = total_value - 1000000
+        print(f"💰 [ポートフォリオ] 現金: {self.cash:,.0f}円 | 株式: {total_stock_value:,.0f}円 | 総資産: {total_value:,.0f}円 (損益: {profit:+,.0f}円)")
+
+    def send_daily_report(self):
+        send_line_notification(f"🏁 【本日トレード終了】\n本日確定損益: {self.daily_pnl:+,.0f}円\n最終現金残高: {self.cash:,.0f}円")
 
 def is_market_open():
-    """現在の時刻が日本株の取引時間内か判定する"""
     now = datetime.now()
-    # 平日のみ（月=0, ..., 金=4）
-    if now.weekday() > 4:
-        return False
-        
+    if now.weekday() > 4: return False
     current_time = now.time()
-    morning_session = datetime.strptime("09:00", "%H:%M").time() <= current_time <= datetime.strptime("11:30", "%H:%M").time()
-    afternoon_session = datetime.strptime("12:30", "%H:%M").time() <= current_time <= datetime.strptime("15:00", "%H:%M").time()
-    
-    return morning_session or afternoon_session
+    morning = datetime.strptime("09:00", "%H:%M").time() <= current_time <= datetime.strptime("11:30", "%H:%M").time()
+    afternoon = datetime.strptime("12:30", "%H:%M").time() <= current_time <= datetime.strptime("15:00", "%H:%M").time()
+    return morning or afternoon
 
 def run_bot():
-    print("=== AutoDayTrade Bot 起動 ===")
-    
-    if not os.path.exists(MODEL_PATH):
-        print(f"エラー: モデルが見つかりません。先に学習(main.py)を実行して {MODEL_PATH} を作成してください。")
-        return
-
-    # モデルと特徴量リストの読み込み
-    print(f"モデルをロード中: {MODEL_PATH}")
-    saved_data = joblib.load(MODEL_PATH)
-    model = saved_data['model']
-    required_features = saved_data['features']
-    print(f"使用する特徴量: {required_features}")
-
+    print("=== AutoDayTrade Multi-Symbol Bot 起動 ===")
+    symbols = Config.SYMBOLS
+    trader = PaperTrader(symbols, initial_cash=1000000)
     fetcher = KabuDataFetcher()
-    symbol = Config.SYMBOL
+    
+    # 複数モデルのロード
+    models = {}
+    req_features = {}
+    for symbol in symbols:
+        model_path = os.path.join(Config.MODEL_PATH, f"latest_{symbol}.joblib")
+        if not os.path.exists(model_path):
+            print(f"エラー: {symbol} のモデルが見つかりません。")
+            return
+        saved_data = joblib.load(model_path)
+        models[symbol] = saved_data['model']
+        req_features[symbol] = saved_data['features']
+        trader.atr_multipliers[symbol] = saved_data.get('atr_multiplier', 2.0)
+        print(f"[{symbol}] モデルロード完了")
 
-    print("監視を開始します。終了する場合は Ctrl+C を押してください。\n")
+    current_prices = {sym: 0.0 for sym in symbols}
 
     try:
         while True:
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # 市場時間外はスリープして待機
+            now = datetime.now()
+            now_str = now.strftime("%H:%M:%S")
+            closing_time = datetime.strptime("15:00", "%H:%M").time()
+
+            # --- 15:00 全銘柄強制終了ロジック ---
+            if now.time() >= closing_time:
+                print(f"\n[{now_str}] 15:00 大引け。全ポジションを清算します。")
+                for symbol in symbols:
+                    if trader.positions[symbol] > 0:
+                        last_price = current_prices[symbol] if current_prices[symbol] > 0 else trader.entry_prices[symbol]
+                        pnl = (last_price - trader.entry_prices[symbol]) * trader.positions[symbol]
+                        trader.cash += (trader.positions[symbol] * last_price)
+                        trader.log_transaction(symbol, "CLOSE_MARKET", last_price, trader.positions[symbol], pnl=pnl)
+                        trader.positions[symbol] = 0
+                trader.send_daily_report()
+                break
+
             if not is_market_open():
-                print(f"[{now_str}] 市場時間外です。待機中...")
-                time.sleep(60) # 1分待機
-                continue
+                print(f"[{now_str}] 市場時間外。待機中...")
+                time.sleep(60); continue
 
-            # 1. 最新データの取得
-            print(f"[{now_str}] データを取得中...")
-            df_live = fetcher.fetch_historical_data(symbol, Config.EXCHANGE)
-            
-            if df_live is None or df_live.empty:
-                print("データの取得に失敗しました。リトライします。")
-                time.sleep(10)
-                continue
+            # --- 全銘柄の巡回監視 ---
+            for symbol in symbols:
+                df_live = fetcher.fetch_historical_data(symbol, Config.EXCHANGE)
+                if df_live is None or len(df_live) < 50:
+                    time.sleep(1); continue # API制限回避
 
-            # 2. 特徴量の計算
-            df_live = add_features(df_live)
-            
-            # データ不足時のガード（※TA-Libの計算に過去の行数が必要なため）
-            if len(df_live) < 50:
-                print("警告: 特徴量計算に必要な行数が不足しています。過去のデータを結合してください。")
-                time.sleep(60)
-                continue
+                df_live = add_features(df_live)
+                latest_row = df_live.iloc[-1:]
+                current_price = latest_row['Close'].values[0]
+                current_atr = latest_row['ATR'].values[0]
+                current_prices[symbol] = current_price # 状況出力用に保存
                 
-            # 最新の1行（直近の足）を取得
-            latest_row = df_live.iloc[-1:]
-            
-            # 3. 予測の実行
-            # 学習時と全く同じ特徴量のみをモデルに渡す
-            X_live = latest_row[required_features]
-            pred_prob = model.predict(X_live)[0]
-            
-            # 4. シグナルの判定と出力
-            current_price = latest_row['Close'].values[0]
-            
-            if pred_prob > 0.5:
-                print(f"📈 【BUY SIGNAL】 現在値: {current_price}円 | 上昇確率: {pred_prob*100:.1f}%")
-                # --------------------------------------------------
-                # ここにkabuステーションAPIの「買い注文」を入れる処理を追加します
-                # --------------------------------------------------
-            else:
-                print(f"⏳ 待機 (確率: {pred_prob*100:.1f}%) | 現在値: {current_price}円")
+                pred_prob = models[symbol].predict(latest_row[req_features[symbol]])[0]
+                
+                # 売買判定
+                if trader.positions[symbol] == 0:
+                    if pred_prob > 0.5:
+                        # 全資金を投じるのではなく、1銘柄あたり最大で資金の何割か、という制限を設けても良い（ここでは全額を単元株計算）
+                        buy_qty = int(trader.cash // (current_price * 100)) * 100
+                        if buy_qty > 0:
+                            trader.cash -= buy_qty * current_price
+                            trader.positions[symbol], trader.entry_prices[symbol] = buy_qty, current_price
+                            trader.stop_losses[symbol] = current_price - (current_atr * trader.atr_multipliers[symbol])
+                            trader.log_transaction(symbol, "BUY", current_price, buy_qty)
+                            print(f"📈 [{symbol}] 仮想買い {buy_qty}株 @ {current_price}円")
+                else:
+                    # トレイリングストップ監視
+                    trader.stop_losses[symbol] = max(trader.stop_losses[symbol], current_price - (current_atr * trader.atr_multipliers[symbol]))
+                    if current_price <= trader.stop_losses[symbol]:
+                        pnl = (current_price - trader.entry_prices[symbol]) * trader.positions[symbol]
+                        trader.cash += (trader.positions[symbol] * current_price)
+                        trader.log_transaction(symbol, "SELL", current_price, trader.positions[symbol], pnl=pnl)
+                        print(f"📉 [{symbol}] 仮想売り {trader.positions[symbol]}株 @ {current_price}円 (損益: {pnl:+,.0f}円)")
+                        trader.positions[symbol] = 0
+                
+                time.sleep(1.5) # API制限回避のインターバル
 
-            # 1分（または任意のインターバル）待機
-            time.sleep(60)
+            print(f"\n--- [{now_str}] 監視サイクル完了 ---")
+            trader.print_status(current_prices)
+            time.sleep(60) # 1分待って次の足へ
             
     except KeyboardInterrupt:
-        print("\n=== Botを停止しました ===")
+        print("\n=== Bot手動停止 ===")
+    finally:
+        trader.print_status(current_prices)
 
 if __name__ == "__main__":
     run_bot()

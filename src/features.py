@@ -1,10 +1,50 @@
-import pandas as pd
+import talib
 import numpy as np
+import pandas as pd
 import os
 from datetime import datetime, timedelta
 
 # 保存先
 FI_LOG_PATH = "data/processed/feature_importance_log.csv"
+
+def add_features(df):
+    """
+    TA-Libを用いて多角的な特徴量を追加する
+    """
+    # 念のためDataFrameのコピーを作成
+    df = df.copy()
+
+    # 1. ボラティリティ
+    df['ATR'] = talib.ATR(df['High'], df['Low'], df['Close'], timeperiod=14)
+    df['BB_upper'], df['BB_middle'], df['BB_lower'] = talib.BBANDS(
+        df['Close'], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0
+    )
+    df['BB_width'] = (df['BB_upper'] - df['BB_lower']) / df['BB_middle']
+    
+    # 2. モメンタム
+    df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
+    df['MACD'], df['MACD_signal'], df['MACD_hist'] = talib.MACD(df['Close'])
+    df['STOCH_k'], df['STOCH_d'] = talib.STOCH(
+        df['High'], df['Low'], df['Close'], 
+        fastk_period=5, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0
+    )
+
+    # 3. トレンド
+    df['ADX'] = talib.ADX(df['High'], df['Low'], df['Close'], timeperiod=14)
+
+    # 4. 出来高
+    df['OBV'] = talib.OBV(df['Close'], df['Volume'])
+
+    # 5. リターン（過去の変化率）
+    df['Return_1'] = df['Close'].pct_change(1)
+    df['Return_5'] = df['Close'].pct_change(5)
+    df['Return_15'] = df['Close'].pct_change(15)
+    df['Return_30'] = df['Close'].pct_change(30)
+
+    # 欠損値を削除
+    df = df.dropna().reset_index(drop=True)
+    
+    return df
 
 def save_feature_importance(model, features):
     """
