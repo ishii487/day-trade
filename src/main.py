@@ -1,118 +1,86 @@
 import os
-import time
+import glob
 import joblib
 import pandas as pd
 import optuna
 import lightgbm as lgb
-from datetime import datetime
 from src.config import Config
-from src.data_fetcher import KabuDataFetcher
 from src.features import add_features
 from src.train import objective, get_dynamic_features_ranked
 from src.utils.notifier import send_line_notification
 
 def main():
-    print("=== AutoDayTrade マルチシンボル学習システム起動 ===")
-    fetcher = KabuDataFetcher()
+    print("=== AutoDayTrade 業界別・汎用モデル学習システム ===")
     os.makedirs(Config.MODEL_PATH, exist_ok=True)
-    os.makedirs(Config.RAW_DATA_PATH, exist_ok=True)
     
-    # 期待されるカラム名のリストと、Excel用日本語変換マップ
-    required_columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-    column_map = {
-        '日付': 'Date', '日時': 'Date', '時刻': 'Date',
-        '始値': 'Open', '寄付': 'Open',
-        '高値': 'High',
-        '安値': 'Low',
-        '終値': 'Close', '現在値': 'Close',
-        '出来高': 'Volume', '売買高': 'Volume', 'TradingVolume': 'Volume'
-    }
+    # 業界フォルダのリストを取得（data/raw/ 以下のディレクトリ）
+    sector_dirs = [d for d in glob.glob(os.path.join(Config.RAW_DATA_PATH, "*")) if os.path.isdir(d)]
 
-    for symbol in Config.SYMBOLS:
-        print(f"\n--- 銘柄 [{symbol}] の学習プロセスを開始 ---")
+    for sector_path in sector_dirs:
+        sector_name = os.path.basename(sector_path)
+        print(f"\n--- 業界 [{sector_name}] の一括学習を開始 ---")
         
-        # 1. APIからのデータ取得（日中の運用時用）
-        new_data_df = fetcher.fetch_historical_data(symbol, Config.EXCHANGE)
-        
-        file_path = os.path.join(Config.RAW_DATA_PATH, f"{symbol}_history.csv")
-        
-        # 2. 既存のCSVデータの読み込み（Excelアドイン等のデータ）
-        if os.path.exists(file_path):
+        # 1. フォルダ内の全CSVを読み込んで合体させる
+        all_files = glob.glob(os.path.join(sector_path, "*.csv"))
+        if not all_files:
+            print(f"[{sector_name}] データファイルが見つかりません。スキップします。")
+            continue
+            
+        sector_df_list = []
+        for file in all_files:
+            # Shift-JIS(cp932)とUTF-8の両方に対応
             try:
-                # 日本語のCSV（Shift-JIS）に対応させるため encoding='cp932' を追加
-                df = pd.read_csv(file_path, encoding='cp932')
-            except UnicodeDecodeError:
-                # もしUTF-8だった場合のフォールバック
-                df = pd.read_csv(file_path, encoding='utf-8')
+                temp_df = pd.read_csv(file, encoding='cp932')
+            except:
+                temp_df = pd.read_csv(file, encoding='utf-8')
             
-            # 日本語カラムがあれば英語に変換
-            df = df.rename(columns=column_map)
+            # カラム名の正規化（以前作成したマッピングを使用）
+            temp_df = temp_df.rename(columns={
+                '日付': 'Date', '日時': 'Date', '始値': 'Open', '寄付': 'Open',
+                '高値': 'High', '安値': 'Low', '終値': 'Close', '出来高': 'Volume'
+            })
             
-            # APIデータがあれば結合して保存
-            if new_data_df is not None and not new_data_df.empty:
-                df = pd.concat([df, new_data_df]).drop_duplicates(subset=['Date'], keep='last').reset_index(drop=True)
-                df.to_csv(file_path, index=False)
-        else:
-            print(f"[{symbol}] データが存在しません（{file_path}）。スキップします。")
-            continue
+            # 相対化特徴量を計算（銘柄ごとに計算してから合体させるのが重要）
+            temp_df = add_features(temp_df)
+            sector_df_list.append(temp_df)
+            print(f"  - {os.path.basename(file)} を読み込みました ({len(temp_df)}行)")
 
-        # 3. データ形式と量のチェック
-        if not all(col in df.columns for col in required_columns):
-            print(f"[{symbol}] カラム構成が不足しています。期待: {required_columns}")
-            continue
-            
-        if len(df) < 100:
-            print(f"[{symbol}] データ不足です（現在 {len(df)}件）。最低100件必要です。スキップします。")
-            continue
-        
-        print(f"[{symbol}] {len(df)}件のデータで学習を開始します...")
+        # 全銘柄を合体
+        df = pd.concat(sector_df_list, ignore_index=True)
+        print(f"[{sector_name}] 合計 {len(df)}行 のビッグデータで学習を開始します...")
 
-        # 4. 特徴量計算とOptuna最適化
-        df = add_features(df)
-        
-        # ここで、実際にデータフレームに存在する特徴量だけを抽出するようにします
-        all_potential_features = get_dynamic_features_ranked(weeks_back=4)
-        ranked_features = [f for f in all_potential_features if f in df.columns]
-        
-        if not ranked_features:
-            print(f"[{symbol}] 利用可能な特徴量がありません。features.pyとtrain.pyのカラム名を確認してください。")
-            continue
-
+        # 2. Optuna最適化
+        ranked_features = get_dynamic_features_ranked()
         study = optuna.create_study(direction='maximize')
         study.optimize(lambda trial: objective(trial, df, ranked_features), n_trials=30)
+        
+        # 3. 最終モデルの構築と保存
         best_params = study.best_params
-        
-        # 5. 最終モデルの構築
-        temp_df = df.copy()
-        future_return = temp_df['Close'].shift(-30) / temp_df['Close'] - 1
-        rolling_thresh = future_return.rolling(window=best_params['rolling_window']).quantile(best_params['target_quantile'])
-        temp_df['Target_Long'] = (future_return > rolling_thresh).astype(int)
-        temp_df = temp_df.dropna().reset_index(drop=True)
-
         selected_features = ranked_features[:best_params['top_n_features']]
-        X_train = temp_df[selected_features]
-        y_train = temp_df['Target_Long']
-
-        lgb_params = {
-            'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
-            'boosting_type': 'gbdt', 'learning_rate': best_params['learning_rate'],
-            'num_leaves': best_params['num_leaves']
-        }
-        final_model = lgb.train(lgb_params, lgb.Dataset(X_train, label=y_train))
         
-        # 6. 保存と通知
-        latest_path = os.path.join(Config.MODEL_PATH, f"latest_{symbol}.joblib")
+        # ターゲット再生成（最終学習用）
+        future_return = df['Close'].shift(-30) / df['Close'] - 1
+        rolling_thresh = future_return.rolling(window=best_params['rolling_window']).quantile(best_params['target_quantile'])
+        df['Target_Long'] = (future_return > rolling_thresh).astype(int)
+        df = df.dropna().reset_index(drop=True)
+
+        final_model = lgb.train(
+            {'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1, 'num_leaves': best_params['num_leaves']},
+            lgb.Dataset(df[selected_features], label=df['Target_Long'])
+        )
+        
+        # 保存：銘柄名ではなく業界名で保存
+        model_name = f"sector_{sector_name}.joblib"
+        save_path = os.path.join(Config.MODEL_PATH, model_name)
         joblib.dump({
             'model': final_model, 
             'features': selected_features,
             'atr_multiplier': best_params['atr_multiplier']
-        }, latest_path)
+        }, save_path)
         
-        send_line_notification(f"🤖 【{symbol} 学習完了】\nスコア: {study.best_value:.4f}")
-        print(f"[{symbol}] モデル保存完了: {latest_path}")
-        time.sleep(3) # API制限回避
+        print(f"[{sector_name}] 汎用モデル保存完了: {save_path}")
 
-    print("\n=== 全銘柄の処理が完了しました ===")
+    print("\n=== 全業界の汎用モデル構築が完了しました ===")
 
 if __name__ == "__main__":
     main()

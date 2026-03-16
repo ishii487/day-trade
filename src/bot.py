@@ -63,19 +63,30 @@ def run_bot():
     trader = PaperTrader(symbols, initial_cash=1000000)
     fetcher = KabuDataFetcher()
     
-    # 複数モデルのロード
+    # 銘柄と業界の対応マップ（data_importerのSECTORSと同じ）
+    symbol_to_sector = {
+        "8306": "banking", "8316": "banking", "8411": "banking", "7182": "banking", "8354": "banking",
+        "7203": "auto", "7267": "auto", "7201": "auto", "7270": "auto", "7261": "auto",
+        "8035": "semi", "6857": "semi", "6146": "semi", "6723": "semi", "7735": "semi",
+        "9432": "telecom", "9433": "telecom", "9434": "telecom", "4443": "telecom", "3994": "telecom",
+        "9101": "shipping", "9104": "shipping", "9107": "shipping", "9110": "shipping", "9119": "shipping"
+    }
+
     models = {}
     req_features = {}
     for symbol in symbols:
-        model_path = os.path.join(Config.MODEL_PATH, f"latest_{symbol}.joblib")
+        sector = symbol_to_sector.get(symbol)
+        model_path = os.path.join(Config.MODEL_PATH, f"sector_{sector}.joblib")
+        
         if not os.path.exists(model_path):
-            print(f"エラー: {symbol} のモデルが見つかりません。")
-            return
+            print(f"エラー: {symbol} (業界:{sector}) のモデルが見つかりません。")
+            continue
+            
         saved_data = joblib.load(model_path)
         models[symbol] = saved_data['model']
         req_features[symbol] = saved_data['features']
         trader.atr_multipliers[symbol] = saved_data.get('atr_multiplier', 2.0)
-        print(f"[{symbol}] モデルロード完了")
+        print(f"[{symbol}] 業界汎用モデル({sector})ロード完了")
 
     current_prices = {sym: 0.0 for sym in symbols}
 
