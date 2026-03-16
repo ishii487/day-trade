@@ -9,41 +9,47 @@ FI_LOG_PATH = "data/processed/feature_importance_log.csv"
 
 def add_features(df):
     """
-    TA-Libを用いて多角的な特徴量を追加する
+    株価の絶対値ではなく、相対的な変化率（%）や倍率に変換した特徴量を生成する
     """
-    # 念のためDataFrameのコピーを作成
     df = df.copy()
 
-    # 1. ボラティリティ
-    df['ATR'] = talib.ATR(df['High'], df['Low'], df['Close'], timeperiod=14)
-    df['BB_upper'], df['BB_middle'], df['BB_lower'] = talib.BBANDS(
-        df['Close'], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0
-    )
-    df['BB_width'] = (df['BB_upper'] - df['BB_lower']) / df['BB_middle']
-    
-    # 2. モメンタム
-    df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
-    df['MACD'], df['MACD_signal'], df['MACD_hist'] = talib.MACD(df['Close'])
-    df['STOCH_k'], df['STOCH_d'] = talib.STOCH(
-        df['High'], df['Low'], df['Close'], 
-        fastk_period=5, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0
-    )
+    # 1. 相対的な価格変化率（リターン）
+    df['Return_1m'] = df['Close'].pct_change(1)
+    df['Return_5m'] = df['Close'].pct_change(5)
+    df['Return_15m'] = df['Close'].pct_change(15)
 
-    # 3. トレンド
-    df['ADX'] = talib.ADX(df['High'], df['Low'], df['Close'], timeperiod=14)
+    # 2. 移動平均からの乖離率（パーセント）
+    df['SMA_15'] = df['Close'].rolling(window=15).mean()
+    df['SMA_15_Dev'] = (df['Close'] / df['SMA_15']) - 1.0  # +0.01 なら1%の上方乖離
 
-    # 4. 出来高
-    df['OBV'] = talib.OBV(df['Close'], df['Volume'])
+    df['SMA_60'] = df['Close'].rolling(window=60).mean()
+    df['SMA_60_Dev'] = (df['Close'] / df['SMA_60']) - 1.0
 
-    # 5. リターン（過去の変化率）
-    df['Return_1'] = df['Close'].pct_change(1)
-    df['Return_5'] = df['Close'].pct_change(5)
-    df['Return_15'] = df['Close'].pct_change(15)
-    df['Return_30'] = df['Close'].pct_change(30)
+    # 3. ボラティリティの正規化（ATRを株価で割ってパーセント化）
+    df['TR'] = np.maximum((df['High'] - df['Low']),
+               np.maximum(abs(df['High'] - df['Close'].shift(1)),
+                          abs(df['Low'] - df['Close'].shift(1))))
+    df['ATR_14'] = df['TR'].rolling(window=14).mean()
+    df['ATR_Pct'] = df['ATR_14'] / df['Close'] # 株価に対するボラティリティの割合
 
-    # 欠損値を削除
+    # 4. 出来高の急増度合い（過去15分平均に対する倍率）
+    df['Vol_SMA_15'] = df['Volume'].rolling(window=15).mean()
+    df['Volume_Ratio'] = df['Volume'] / df['Vol_SMA_15'].replace(0, np.nan) # 3.0なら平均の3倍の出来高
+
+    # 5. RSI (元々0〜100に正規化されているオシレーター指標なのでそのまま使用)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df['RSI_14'] = 100 - (100 / (1 + rs))
+
+    # 💡 AIのカンニング・ノイズ防止：絶対値を含む計算用カラムを削除する
+    # Open, High, Low, Close自体はターゲット生成に使うため残すが、学習特徴量からは外れる設計にする
+    df = df.drop(columns=['SMA_15', 'SMA_60', 'TR', 'ATR_14', 'Vol_SMA_15'])
+
+    # 欠損値（計算不能な最初の数行）を削除
     df = df.dropna().reset_index(drop=True)
-    
+
     return df
 
 def save_feature_importance(model, features):

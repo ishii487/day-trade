@@ -69,7 +69,14 @@ def main():
 
         # 4. 特徴量計算とOptuna最適化
         df = add_features(df)
-        ranked_features = get_dynamic_features_ranked(weeks_back=4)
+        
+        # ここで、実際にデータフレームに存在する特徴量だけを抽出するようにします
+        all_potential_features = get_dynamic_features_ranked(weeks_back=4)
+        ranked_features = [f for f in all_potential_features if f in df.columns]
+        
+        if not ranked_features:
+            print(f"[{symbol}] 利用可能な特徴量がありません。features.pyとtrain.pyのカラム名を確認してください。")
+            continue
 
         study = optuna.create_study(direction='maximize')
         study.optimize(lambda trial: objective(trial, df, ranked_features), n_trials=30)

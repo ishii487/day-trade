@@ -111,9 +111,14 @@ def run_bot():
                 df_live = add_features(df_live)
                 latest_row = df_live.iloc[-1:]
                 current_price = latest_row['Close'].values[0]
-                current_atr = latest_row['ATR'].values[0]
+                
+                # 【修正箇所】ATRを相対値(ATR_Pct)から絶対値(円)に変換して取得
+                current_atr = latest_row['ATR_Pct'].values[0] * current_price
+                
                 current_prices[symbol] = current_price # 状況出力用に保存
                 
+                # 特徴量の名前が自動的にモデル保存時のもの(req_features)と一致するので
+                # predict部分はそのまま動きます
                 pred_prob = models[symbol].predict(latest_row[req_features[symbol]])[0]
                 
                 # 売買判定
